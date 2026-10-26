@@ -92,10 +92,10 @@ outputs:
 runs:
   using: composite
   steps:
-    # On a Lizard runner whose cache disk lasts (LIZARD_CACHE_PERSISTENT, set by the runner VM): keep a
-    # bare mirror of the repository on it, bring it up to date (only new objects travel), and point
-    # the checkout's object store at it (git alternates). actions/checkout then fetches only what the
-    # mirror lacks. Anywhere else this step does nothing.
+    # On a Lizard runner whose cache disk lasts (LIZARD_CACHE_PERSISTENT, set by the runner VM): a bare
+    # mirror of the repository on it, brought up to date by default-branch jobs (the only ones whose
+    # writes are kept), and the checkout's object store pointed at it (git alternates), so
+    # actions/checkout fetches only what the mirror lacks. Anywhere else this step does nothing.
     - name: Repository mirror
       if: inputs.ssh-key == ''
       shell: bash
@@ -109,18 +109,30 @@ runs:
         # Set by the Lizard runner VM (its .env), not visible to `if:` expressions.
         [ "${LIZARD_CACHE_PERSISTENT:-}" = true ] && [ -n "${LIZARD_CACHE_DIR:-}" ] || exit 0
         case "$LIZARD_REPO" in */*) ;; *) exit 0 ;; esac
+        case "/$LIZARD_REPO/" in */../*|*/./*) exit 0 ;; esac
         mirror="$LIZARD_CACHE_DIR/git/$LIZARD_REPO.git"
         url="$LIZARD_SERVER/$LIZARD_REPO"
-        mkdir -p "$(dirname "$mirror")"
-        [ -d "$mirror/objects" ] || git init -q --bare "$mirror"
-        auth=$(printf 'x-access-token:%s' "$LIZARD_TOKEN" | base64 -w0)
-        start=$(date +%s)
-        if git -C "$mirror" -c "http.extraheader=AUTHORIZATION: basic $auth" fetch -q --prune --no-tags "$url" '+refs/heads/*:refs/heads/*'; then
-          echo "Lizard: repository mirror up to date in $(( $(date +%s) - start ))s"
-        else
-          echo "::warning::Lizard: could not update the repository mirror; checking out without it"
-          exit 0
+        # The job-started hook decided whether this job's writes to the cache are kept: only a
+        # default-branch push/schedule/dispatch updates the mirror; any other job borrows it as is.
+        promote=$(cat /run/lizard/promote 2>/dev/null)
+        if [ "$promote" = promote ]; then
+          mkdir -p "$(dirname "$mirror")"
+          [ -d "$mirror/objects" ] || git init -q --bare "$mirror"
+          start=$(date +%s)
+          # Only this job's ref; no hooks, no global/system config; the token in the environment,
+          # not on the command line.
+          if GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+             GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=http.extraheader \
+             GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$LIZARD_TOKEN" | base64 -w0)" \
+             GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null \
+             git -C "$mirror" fetch -q --prune --no-tags "$url" "+${GITHUB_REF}:${GITHUB_REF}"; then
+            echo "Lizard: repository mirror up to date in $(( $(date +%s) - start ))s"
+          else
+            echo "::warning::Lizard: could not update the repository mirror; checking out without it"
+            exit 0
+          fi
         fi
+        [ -d "$mirror/objects" ] || exit 0
         target="$GITHUB_WORKSPACE${LIZARD_PATH:+/$LIZARD_PATH}"
         if [ ! -d "$target/.git" ]; then
           mkdir -p "$target"
