@@ -129,6 +129,14 @@ runs:
         fi
         mkdir -p "$target/.git/objects/info"
         echo "$mirror/objects" > "$target/.git/objects/info/alternates"
+        # actions/checkout cleans an existing repository with `git reset --hard HEAD`, and starts over
+        # when that fails -- as it does on a repository without a commit. Give it one: the job's
+        # commit (or any the mirror has), found locally through the alternates.
+        sha=$(git -C "$mirror" rev-parse -q --verify "${GITHUB_SHA:-none}^{commit}" 2>/dev/null \
+          || git -C "$mirror" for-each-ref --count=1 --format='%(objectname)' refs/heads)
+        if [ -n "$sha" ] && ! git -C "$target" rev-parse -q --verify HEAD >/dev/null 2>&1; then
+          git -C "$target" update-ref --no-deref HEAD "$sha"
+        fi
     - id: checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
