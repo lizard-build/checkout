@@ -1,0 +1,155 @@
+name: Lizard checkout
+description: actions/checkout, with the repository mirrored on the Lizard runner's cache disk so a checkout fetches only new commits
+author: Lizard
+branding:
+  icon: git-branch
+  color: green
+inputs:
+  repository:
+    description: "Repository name with owner. For example, actions/checkout"
+    required: false
+    default: "${{ github.repository }}"
+  ref:
+    description: "The branch, tag or SHA to checkout. When checking out the repository that triggered a workflow, this defaults to the reference or SHA for that event.  Otherwise, uses the default branch."
+    required: false
+  token:
+    description: "Personal access token (PAT) used to fetch the repository. The PAT is configured with the local git config, which enables your scripts to run authenticated git commands. The post-job step removes the PAT.\n\nWe recommend using a service account with the least permissions necessary. Also when generating a new PAT, select the least scopes necessary.\n\n[Learn more about creating and using encrypted secrets](https://help.github.com/en/actions/automating-your-workflow-with-github-actions/creating-and-using-encrypted-secrets)"
+    required: false
+    default: "${{ github.token }}"
+  ssh-key:
+    description: "SSH key used to fetch the repository. The SSH key is configured with the local git config, which enables your scripts to run authenticated git commands. The post-job step removes the SSH key.\n\nWe recommend using a service account with the least permissions necessary.\n\n[Learn more about creating and using encrypted secrets](https://help.github.com/en/actions/automating-your-workflow-with-github-actions/creating-and-using-encrypted-secrets)"
+    required: false
+  ssh-known-hosts:
+    description: "Known hosts in addition to the user and global host key database. The public SSH keys for a host may be obtained using the utility `ssh-keyscan`. For example, `ssh-keyscan github.com`. The public key for github.com is always implicitly added."
+    required: false
+  ssh-strict:
+    description: "Whether to perform strict host key checking. When true, adds the options `StrictHostKeyChecking=yes` and `CheckHostIP=no` to the SSH command line. Use the input `ssh-known-hosts` to configure additional hosts."
+    required: false
+    default: "true"
+  ssh-user:
+    description: "The user to use when connecting to the remote SSH host. By default 'git' is used."
+    required: false
+    default: "git"
+  persist-credentials:
+    description: "Whether to configure the token or SSH key with the local git config"
+    required: false
+    default: "true"
+  path:
+    description: "Relative path under $GITHUB_WORKSPACE to place the repository"
+    required: false
+  clean:
+    description: "Whether to execute `git clean -ffdx && git reset --hard HEAD` before fetching"
+    required: false
+    default: "true"
+  filter:
+    description: "Partially clone against a given filter. Overrides sparse-checkout if set."
+    required: false
+  sparse-checkout:
+    description: "Do a sparse checkout on given patterns. Each pattern should be separated with new lines."
+    required: false
+  sparse-checkout-cone-mode:
+    description: "Specifies whether to use cone-mode when doing a sparse checkout."
+    required: false
+    default: "true"
+  fetch-depth:
+    description: "Number of commits to fetch. 0 indicates all history for all branches and tags."
+    required: false
+    default: "1"
+  fetch-tags:
+    description: "Whether to fetch tags, even if fetch-depth > 0."
+    required: false
+    default: "false"
+  show-progress:
+    description: "Whether to show progress status output when fetching."
+    required: false
+    default: "true"
+  lfs:
+    description: "Whether to download Git-LFS files"
+    required: false
+    default: "false"
+  submodules:
+    description: "Whether to checkout submodules: `true` to checkout submodules or `recursive` to recursively checkout submodules.\n\nWhen the `ssh-key` input is not provided, SSH URLs beginning with `git@github.com:` are converted to HTTPS."
+    required: false
+    default: "false"
+  set-safe-directory:
+    description: "Add repository path as safe.directory for Git global config by running `git config --global --add safe.directory <path>`"
+    required: false
+    default: "true"
+  github-server-url:
+    description: "The base URL for the GitHub instance that you are trying to clone from, will use environment defaults to fetch from the same instance that the workflow is running from unless specified. Example URLs are https://github.com or https://my-ghes-server.example.com"
+    required: false
+  allow-unsafe-pr-checkout:
+    description: "Required to check out fork pull request code from a workflow triggered by `pull_request_target` or `workflow_run`. These workflows run with the base repository's GITHUB_TOKEN, secrets, default-branch cache scope, and runner access; fetching and executing a fork's code in that trusted context commonly leads to \"pwn request\" vulnerabilities. Set to `true` only after reviewing the risks at https://gh.io/securely-using-pull_request_target."
+    required: false
+    default: "false"
+outputs:
+  ref:
+    description: The branch, tag or SHA that was checked out
+    value: ${{ steps.checkout.outputs.ref }}
+  commit:
+    description: The commit SHA that was checked out
+    value: ${{ steps.checkout.outputs.commit }}
+runs:
+  using: composite
+  steps:
+    # On a Lizard runner whose cache disk lasts (LIZARD_CACHE_PERSISTENT, set by the runner VM): keep a
+    # bare mirror of the repository on it, bring it up to date (only new objects travel), and point
+    # the checkout's object store at it (git alternates). actions/checkout then fetches only what the
+    # mirror lacks. Anywhere else this step does nothing.
+    - name: Repository mirror
+      if: inputs.ssh-key == ''
+      shell: bash
+      env:
+        LIZARD_REPO: ${{ inputs.repository }}
+        LIZARD_SERVER: ${{ inputs.github-server-url || github.server_url }}
+        LIZARD_PATH: ${{ inputs.path }}
+        LIZARD_TOKEN: ${{ inputs.token }}
+      run: |
+        set -uo pipefail
+        # Set by the Lizard runner VM (its .env), not visible to `if:` expressions.
+        [ "${LIZARD_CACHE_PERSISTENT:-}" = true ] && [ -n "${LIZARD_CACHE_DIR:-}" ] || exit 0
+        case "$LIZARD_REPO" in */*) ;; *) exit 0 ;; esac
+        mirror="$LIZARD_CACHE_DIR/git/$LIZARD_REPO.git"
+        url="$LIZARD_SERVER/$LIZARD_REPO"
+        mkdir -p "$(dirname "$mirror")"
+        [ -d "$mirror/objects" ] || git init -q --bare "$mirror"
+        auth=$(printf 'x-access-token:%s' "$LIZARD_TOKEN" | base64 -w0)
+        start=$(date +%s)
+        if git -C "$mirror" -c "http.extraheader=AUTHORIZATION: basic $auth" fetch -q --prune --no-tags "$url" '+refs/heads/*:refs/heads/*'; then
+          echo "Lizard: repository mirror up to date in $(( $(date +%s) - start ))s"
+        else
+          echo "::warning::Lizard: could not update the repository mirror; checking out without it"
+          exit 0
+        fi
+        target="$GITHUB_WORKSPACE${LIZARD_PATH:+/$LIZARD_PATH}"
+        if [ ! -d "$target/.git" ]; then
+          mkdir -p "$target"
+          git init -q "$target"
+          git -C "$target" remote add origin "$url"
+        fi
+        mkdir -p "$target/.git/objects/info"
+        echo "$mirror/objects" > "$target/.git/objects/info/alternates"
+    - id: checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: ${{ inputs.repository }}
+        ref: ${{ inputs.ref }}
+        token: ${{ inputs.token }}
+        ssh-key: ${{ inputs.ssh-key }}
+        ssh-known-hosts: ${{ inputs.ssh-known-hosts }}
+        ssh-strict: ${{ inputs.ssh-strict }}
+        ssh-user: ${{ inputs.ssh-user }}
+        persist-credentials: ${{ inputs.persist-credentials }}
+        path: ${{ inputs.path }}
+        clean: ${{ inputs.clean }}
+        filter: ${{ inputs.filter }}
+        sparse-checkout: ${{ inputs.sparse-checkout }}
+        sparse-checkout-cone-mode: ${{ inputs.sparse-checkout-cone-mode }}
+        fetch-depth: ${{ inputs.fetch-depth }}
+        fetch-tags: ${{ inputs.fetch-tags }}
+        show-progress: ${{ inputs.show-progress }}
+        lfs: ${{ inputs.lfs }}
+        submodules: ${{ inputs.submodules }}
+        set-safe-directory: ${{ inputs.set-safe-directory }}
+        github-server-url: ${{ inputs.github-server-url }}
+        allow-unsafe-pr-checkout: ${{ inputs.allow-unsafe-pr-checkout }}
